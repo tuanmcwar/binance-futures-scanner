@@ -1,14 +1,22 @@
 
 const axios = require("axios");
 const config = require("../config/config");
+const subscribers = require("../utils/subscribers");
+const { log } = require("../utils/logger");
+
+const sleep = ms =>
+  new Promise(resolve => setTimeout(resolve, ms));
 
 function formatTime(timestamp) {
   if (!timestamp) return "Không có dữ liệu";
 
-  return new Date(timestamp).toLocaleString("vi-VN", {
-    timeZone: "Asia/Ho_Chi_Minh",
-    hour12: false
-  });
+  return new Date(timestamp).toLocaleString(
+    "vi-VN",
+    {
+      timeZone: "Asia/Ho_Chi_Minh",
+      hour12: false
+    }
+  );
 }
 
 function formatNumber(value) {
@@ -35,15 +43,30 @@ function formatPercent(value, digits = 4) {
     return "Không có dữ liệu";
   }
 
-  return `${value > 0 ? "+" : ""}${value.toFixed(digits)}%`;
+  return (
+    `${value > 0 ? "+" : ""}` +
+    `${value.toFixed(digits)}%`
+  );
 }
 
-async function sendMessage(text, symbol = null) {
-  const { token, chatId } = config.telegram;
+function createKeyboard(symbol) {
+  if (!symbol) return undefined;
 
-  if (!token || !chatId) {
-    throw new Error("Thiếu Telegram Token hoặc Chat ID");
-  }
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: "📊 Xem biểu đồ CoinGlass",
+          url:
+            `https://www.coinglass.com/tv/vi/Binance_${symbol}`
+        }
+      ]
+    ]
+  };
+}
+
+async function sendToChat(chatId, text, symbol) {
+  const { token } = config.telegram;
 
   const payload = {
     chat_id: chatId,
@@ -52,23 +75,128 @@ async function sendMessage(text, symbol = null) {
   };
 
   if (symbol) {
-    payload.reply_markup = {
-      inline_keyboard: [
-        [
-          {
-            text: "📊 Xem biểu đồ CoinGlass",
-            url: `https://www.coinglass.com/tv/vi/Binance_${symbol}`
-          }
-        ]
-      ]
+    payload.reply_markup = createKeyboard(symbol);
+  }
+
+  const url =
+    `https://api.telegram.org/bot${token}/sendMessage`;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await axios.post(
+        url,
+        payload,
+        { timeout: 15000 }
+      );
+
+      return true;
+    } catch (error) {
+      const status = error.response?.status;
+      const errorCode =
+        error.response?.data?.error_code;
+
+      // Người dùng chặn bot hoặc chat không còn hợp lệ
+      if (status === 403) {
+        try {
+          subscribers.removeSubscriber(chatId);
+          log(`Đã hủy đăng ký chat ${chatId}: 403`);
+        } catch (saveError) {
+          log(`Lỗi lưu subscriber: ${saveError.message}`);
+        }
+
+        return false;
+      }
+
+      // Không xóa subscriber nếu chỉ bị lỗi mạng
+      if (status === 400) {
+        log(
+          `Không gửi được chat ${chatId}: ` +
+          JSON.stringify(error.response?.data)
+        );
+        return false;
+      }
+
+      if (status === 429) {
+        const retryAfter =
+          Number(
+            error.response?.data?.parameters
+              ?.retry_after
+          ) || 5;
+
+        log(
+          `Telegram rate limit, chờ ${retryAfter}s`
+        );
+
+        await sleep(retryAfter * 1000);
+        continue;
+      }
+
+      if (
+        attempt === 3 ||
+        (status && status < 500)
+      ) {
+        log(
+          `Gửi Telegram lỗi ${chatId}: ` +
+          error.message
+        );
+        return false;
+      }
+
+      await sleep(1000 * attempt);
+    }
+  }
+
+  return false;
+}
+
+// Gửi một thông báo cho tất cả người đăng ký
+async function sendMessage(text, symbol = null) {
+  const users = subscribers.getSubscribers();
+
+  if (users.length === 0) {
+    log("Chưa có người đăng ký Telegram");
+    return {
+      total: 0,
+      success: 0,
+      failed: 0
     };
   }
 
-  await axios.post(
-    `https://api.telegram.org/bot${token}/sendMessage`,
-    payload,
-    { timeout: 15000 }
+  let success = 0;
+  let failed = 0;
+
+  for (const chatId of users) {
+    // Người dùng có thể /stop trong khi đang gửi
+    if (!subscribers.hasSubscriber(chatId)) {
+      continue;
+    }
+
+    const sent = await sendToChat(
+      chatId,
+      text,
+      symbol
+    );
+
+    if (sent) {
+      success++;
+    } else {
+      failed++;
+    }
+
+    // Giới hạn tốc độ gửi, tránh spam Telegram
+    await sleep(100);
+  }
+
+  log(
+    `📨 Telegram: thành công ${success}, ` +
+    `thất bại ${failed}`
   );
+
+  return {
+    total: users.length,
+    success,
+    failed
+  };
 }
 
 async function sendAlert(coin) {
@@ -95,14 +223,15 @@ async function sendAlert(coin) {
 
     basisLines = [
       status,
-      `📊 Basis Rate: ${formatPercent(basis.basisRate)}`,
-      `💰 Futures Price: ${formatPrice(basis.futuresPrice)}`,
-      `📍 Index Price: ${formatPrice(basis.indexPrice)}`,
-      `📉 Basis: ${formatPrice(basis.basis)}`
+      "",
+      `📊 Tỷ lệ chênh lệch: ${formatPercent(basis.basisRate)}`,
+      `💰 Giá Futures: ${formatPrice(basis.futuresPrice)}`,
+      `📍 Giá Index: ${formatPrice(basis.indexPrice)}`,
+      `📉 Chênh lệch giá: ${formatPrice(basis.basis)}`
     ];
   } else {
     basisLines = [
-      "📊 BASIS INFORMATION",
+      "📊 THÔNG TIN CHÊNH LỆCH GIÁ",
       "Không có dữ liệu"
     ];
   }
@@ -130,7 +259,7 @@ async function sendAlert(coin) {
   }
 
   const message = [
-    "🚀 BINANCE FUTURES PUMP ALERT",
+    "🚀 BINANCE FUTURES 1H PUMP ALERT",
     "",
     `🪙 Coin: ${coin.symbol}`,
     `📈 Tăng 1H: +${coin.percent.toFixed(2)}%`,
@@ -143,9 +272,10 @@ async function sendAlert(coin) {
     ...orderBookLines,
     "",
     `🕒 Dữ liệu lấy lúc: ${formatTime(coin.snapshotTime)}`,
+    `⏰ Cảnh báo: ${formatTime(Date.now())}`
   ].join("\n");
 
-  await sendMessage(message, coin.symbol);
+  return sendMessage(message, coin.symbol);
 }
 
 module.exports = {
