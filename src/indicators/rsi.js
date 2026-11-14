@@ -18,6 +18,7 @@ function calculateRSI(closes, period = 14) {
 
   for (let i = 1; i <= period; i++) {
     const change = closes[i] - closes[i - 1];
+
     avgGain += Math.max(change, 0);
     avgLoss += Math.max(-change, 0);
   }
@@ -40,6 +41,7 @@ function calculateRSI(closes, period = 14) {
   if (avgGain === 0) return 0;
 
   const rs = avgGain / avgLoss;
+
   return 100 - 100 / (1 + rs);
 }
 

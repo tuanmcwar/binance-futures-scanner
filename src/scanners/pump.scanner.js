@@ -62,7 +62,7 @@ async function syncCandles() {
       try {
         const candle = await binance.getCandle(symbol);
 
-        if (candle.openTime === currentHour()) {
+        if (candle?.openTime === currentHour()) {
           candles.set(symbol, candle);
         }
       } catch (error) {
@@ -117,41 +117,55 @@ async function scanMarket() {
     }
   }
 
-  // Ưu tiên coin tăng mạnh nhất
   signals.sort((a, b) => b.percent - a.percent);
 
   for (const coin of signals) {
     if (currentHour() !== hour) break;
     if (state.hasAlerted(coin.symbol, hour)) continue;
 
-    // Lấy RSI và Funding đồng thời
-    const [rsiResult, fundingResult] =
-      await Promise.allSettled([
-        binance.getRSI(
-          coin.symbol,
-          config.scanner.rsiPeriod
-        ),
-        binance.getFunding(coin.symbol)
-      ]);
-
-    if (rsiResult.status === "fulfilled") {
-      coin.rsi = rsiResult.value;
-    } else {
-      coin.rsi = null;
-      log(`RSI lỗi ${coin.symbol}: ${rsiResult.reason.message}`);
-    }
-
-    if (fundingResult.status === "fulfilled") {
-      coin.funding = fundingResult.value;
-    } else {
-      coin.funding = null;
-      log(
-        `Funding lỗi ${coin.symbol}: ${fundingResult.reason.message}`
+    // Lấy snapshot mới ngay trước khi gửi Telegram
+    try {
+      const snapshot = await binance.getMarketSnapshot(
+        coin.symbol,
+        config.scanner.rsiPeriod
       );
+
+      coin.rsi = snapshot.rsi;
+      coin.funding = snapshot.funding;
+      coin.basis = snapshot.basis;
+      coin.orderBook = snapshot.orderBook;
+      coin.snapshotTime = snapshot.receivedAt;
+
+      // Cập nhật lại mức tăng theo giá Futures mới nhất
+      if (snapshot.basis) {
+        coin.price = snapshot.basis.futuresPrice;
+
+        coin.percent =
+          (coin.price / coin.open - 1) * 100;
+      }
+    } catch (error) {
+      log(
+        `Snapshot lỗi ${coin.symbol}: ${error.message}`
+      );
+
+      coin.rsi = null;
+      coin.funding = null;
+      coin.basis = null;
+      coin.orderBook = null;
+      coin.snapshotTime = null;
     }
 
     // Không gửi nếu nến đã chuyển sang giờ mới
     if (currentHour() !== hour) break;
+
+    // Giá mới nhất không còn vượt ngưỡng thì bỏ qua
+    if (coin.percent <= config.scanner.threshold) {
+      log(
+        `Bỏ qua ${coin.symbol}: giá giảm còn ` +
+        `${coin.percent.toFixed(2)}%`
+      );
+      continue;
+    }
 
     state.markAlerted(coin.symbol, hour);
 
@@ -160,13 +174,14 @@ async function scanMarket() {
 
       log(
         `🚀 ${coin.symbol} +${coin.percent.toFixed(2)}%` +
-        ` | RSI: ${coin.rsi?.toFixed(2) ?? "N/A"}`
+        ` | RSI: ${coin.rsi?.toFixed(2) ?? "N/A"}` +
+        ` | Basis: ${coin.basis?.basisRate?.toFixed(4) ?? "N/A"}%` +
+        ` | Imbalance: ${coin.orderBook?.imbalance?.toFixed(2) ?? "N/A"}%`
       );
     } catch (error) {
-      // Timeout có thể xảy ra sau khi Telegram đã nhận tin.
-      // Gửi lại có rủi ro tạo cảnh báo trùng.
       state.unmarkAlerted(coin.symbol, hour);
-      log(`Telegram lỗi: ${error.message}`);
+
+      log(`Telegram lỗi ${coin.symbol}: ${error.message}`);
     }
 
     await sleep(150);
@@ -177,7 +192,6 @@ async function scanMarket() {
   );
 }
 
-
 async function startScanner() {
   await syncTime();
   state.loadState(currentHour());
@@ -185,7 +199,9 @@ async function startScanner() {
   let lastTimeSync = Date.now();
   let lastScannedHour = null;
 
-  log(`Bot chỉ quét vào phút ${config.scanner.scanMinute}`);
+  log(
+    `Bot chỉ quét vào phút ${config.scanner.scanMinute}`
+  );
 
   while (true) {
     try {
@@ -205,34 +221,34 @@ async function startScanner() {
       }
 
       const now = new Date(Date.now() + serverOffset);
-
-      // Dùng UTC vì phút trong giờ giống nhau
-      // giữa UTC và giờ Việt Nam (+7)
       const minute = now.getUTCMinutes();
       const hour = currentHour();
 
-      // Chỉ quét 1 lần mỗi giờ tại phút 58
       if (
         minute === config.scanner.scanMinute &&
         lastScannedHour !== hour
       ) {
-        log("⏰ Đến phút 58, bắt đầu quét Futures");
+        log(
+          `⏰ Đến phút ${config.scanner.scanMinute}, ` +
+          `bắt đầu quét Futures`
+        );
 
         await syncCandles();
         await scanMarket();
 
         lastScannedHour = hour;
 
-        log("✅ Hoàn thành lượt quét phút 58");
+        log(
+          `✅ Hoàn thành lượt quét phút ` +
+          config.scanner.scanMinute
+        );
       }
     } catch (error) {
       log(`Scanner lỗi: ${error.message}`);
     }
 
-    // Kiểm tra thời gian mỗi giây
     await sleep(1000);
   }
 }
-
 
 module.exports = { startScanner };
