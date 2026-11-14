@@ -56,7 +56,7 @@ function createKeyboard(symbol) {
     inline_keyboard: [
       [
         {
-          text: "📊 Xem biểu đồ CoinGlass",
+          text: "📊CoinGlass",
           url:
             `https://www.coinglass.com/tv/vi/Binance_${symbol}`
         }
